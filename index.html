@@ -4,8 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="theme-color" content="#0e1113" id="metaTheme">
-<meta name="description" content="Personal trainer hibrido adaptativo: aquecimento, treino, corrida, evolucao e descanso.">
-<title>Treino Híbrido</title>
+<meta name="description" content="Treino Simples: personal trainer adaptativo com aquecimento, treino, corrida, evolucao e descanso.">
+<title>Treino Simples</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700&family=Barlow:wght@400;500;600&family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet">
@@ -264,7 +264,7 @@ canvas{display:block;max-width:100%}
 
 <script>
 /* ================================================================
-   TREINO HÍBRIDO v7
+   TREINO SIMPLES v9
    ================================================================ */
 
 /* ---------------- 0. UTILITÁRIOS ---------------- */
@@ -399,7 +399,7 @@ function buildTheme(rec,baseHue,seed){
   const danger = fixContrast(6,   58, D?62:46, bg, 4.6, D);
   const [ar,ag,ab]=hex2rgb(accent);
   return {
-    id:rec.id, light:!D,
+    id:rec.id, light:!D, hue:h,
     label:`${rec.name} · ${hueName(h)}`,
     bg,surface,surface2,line,text,muted,accent,accent2,ok,warn,danger,
     accentSoft:`rgba(${ar},${ag},${ab},${D?.13:.11})`,
@@ -413,6 +413,13 @@ function generateThemes(profile){
     ? RECIPES.slice()
     : [...RECIPES.filter(r=>!r.dark),...RECIPES.filter(r=>r.dark)];
   return {sem, themes: ordered.map(r=>buildTheme(r,sem.hue,sem.seed))};
+}
+/* Regenera um tema já escolhido com outro matiz base, mantendo a
+   mesma "textura" (claro/escuro, saturação, contraste) da receita
+   original — usado no editor simples de cor das Configurações. */
+function retintTheme(themeId,newHue,seed){
+  const rec=RECIPES.find(r=>r.id===themeId)||RECIPES[0];
+  return buildTheme(rec,newHue,seed||0);
 }
 function applyTheme(t){
   if(!t) return;
@@ -933,7 +940,8 @@ function readiness(r){
    Tenta o armazenamento do ambiente e cai para o do navegador,
    de modo que o arquivo funcione hospedado ou baixado.
    ================================================================ */
-const KEY='treino_hibrido_v7';
+const KEY='treino_simples_v9';
+const KEY_LEGACY='treino_hibrido_v7';
 const Store=(()=>{
   const mem={};
   const art = typeof window!=='undefined' && window.storage && typeof window.storage.get==='function';
@@ -969,7 +977,7 @@ function newProfile(o={}){
     defaultMode: locs.includes('full')?'full':locs[0],
     theme:o.theme||null, cycleStart:todayKey(),
     taf:o.taf||{barra:0,flexao:0,abdominal:0,corridaDist:2400,corridaTempo:'',natacaoDist:200,natacaoTempo:''},
-    state:{days:{},sessions:{},runs:[]}
+    state:{days:{},sessions:{},runs:[],activities:[]}
   };
 }
 /* Mapa de compatibilidade: os 4 objetivos antigos (v7) viram
@@ -980,7 +988,7 @@ function migrate(d){
   if(!d||!d.profiles||!d.profiles.length) return null;
   d.profiles.forEach(p=>{
     p.state=p.state||{}; p.state.days=p.state.days||{};
-    p.state.sessions=p.state.sessions||{}; p.state.runs=p.state.runs||[];
+    p.state.sessions=p.state.sessions||{}; p.state.runs=p.state.runs||[]; p.state.activities=p.state.activities||[];
     if(!Array.isArray(p.goals)) p.goals=[p.goal||'forca'];
     p.goals=p.goals.map(g=>GOALS[g]?g:(GOAL_MIGRATE[g]||'forca'));
     if(!p.goals.length) p.goals=['forca'];
@@ -1011,8 +1019,8 @@ function planName(p){
   const sem=readSemantics(p);
   const N={tatico:'Protocolo Tático',combate:'Protocolo de Combate',arte:'Protocolo Expressivo',
     natureza:'Protocolo de Campo',agua:'Protocolo Aquático',tecnico:'Protocolo Equilíbrio',
-    corrida:'Protocolo de Ritmo',neutro:'Protocolo Híbrido'};
-  return N[sem.family]||'Protocolo Híbrido';
+    corrida:'Protocolo de Ritmo',neutro:'Protocolo Equilibrado'};
+  return N[sem.family]||'Protocolo Equilibrado';
 }
 
 /* ================================================================
@@ -1033,7 +1041,7 @@ function renderInterview(){
 
   if(s===0){
     h=`<div class="wrap-center center">
-      <div class="mark">Treino<br><span>Híbrido</span></div>
+      <div class="mark">Treino<br><span>Simples</span></div>
       <div class="rule" style="margin:18px auto"></div>
       <p class="mut" style="max-width:430px;margin:0 auto 8px">Um plano completo para todos os sete dias da semana, montado a partir de quem você é e do que tem disponível.</p>
       <div class="chips" style="justify-content:center;margin-bottom:26px">
@@ -1322,19 +1330,21 @@ function viewSemana(){
   const base=parseKey(SEL); const mon=new Date(base); mon.setDate(base.getDate()-((base.getDay()+6)%7));
   let h=`<header class="bar"><div class="id"><b>Guia semanal</b><span>toque em um dia para abrir</span></div>
     <button class="btn tiny" data-act="prevWeek">‹</button><button class="btn tiny" data-act="nextWeek">›</button></header>`;
-  let treinos=0, feitos=0, corridas=0;
+  let treinos=0, feitos=0, corridas=0, atividades=0;
   h+='<div class="wk">';
   for(let i=0;i<7;i++){
     const d=new Date(mon); d.setDate(mon.getDate()+i); const k=iso(d);
     const S=buildSession(P,k), lk=isLocked(k);
     const runs=(P.state.runs||[]).filter(r=>r.dateKey===k);
-    corridas+=runs.length; if(!S.isRest) treinos++; if(lk) feitos++;
+    const acts=(P.state.activities||[]).filter(a=>a.dateKey===k);
+    corridas+=runs.length; atividades+=acts.length; if(!S.isRest) treinos++; if(lk) feitos++;
     const ds=P.state.days[k];
     const draft=!lk&&ds&&(Object.keys(ds.done||{}).length||Object.keys(ds.warmDone||{}).length);
+    const extras=[runs.length?`${runs.length} corrida${runs.length>1?'s':''}`:'',acts.length?`${acts.length} atividade${acts.length>1?'s':''}`:''].filter(Boolean).join(' · ');
     h+=`<button class="wd ${lk?'done':''} ${S.isRest?'rest':''} ${k===todayKey()?'today':''}" data-goday="${k}">
       <span class="wd-d"><b>${DOWL[d.getDay()]}</b><i>${String(d.getDate()).padStart(2,'0')}</i></span>
       <span class="wd-b"><b>${S.icon} ${esc(S.title)}</b>
-        <span>${lk?'Concluído':(draft?'Rascunho em andamento':(S.isRest?'Descanso programado':`${S.blocks.reduce((a,b)=>a+b.it.length,0)} exercícios · RPE ${S.rpe}`))}${runs.length?` · ${runs.length} corrida${runs.length>1?'s':''}`:''}</span></span>
+        <span>${lk?'Concluído':(draft?'Rascunho em andamento':(S.isRest?'Descanso programado':`${S.blocks.reduce((a,b)=>a+b.it.length,0)} exercícios · RPE ${S.rpe}`))}${extras?` · ${extras}`:''}</span></span>
       <span class="li-r">${lk?'✓':(S.isRest?'○':'›')}</span></button>`;
   }
   h+='</div>';
@@ -1344,6 +1354,7 @@ function viewSemana(){
       <div class="stat"><b>${treinos}</b><span>Treinos</span></div>
       <div class="stat"><b>${7-treinos}</b><span>Descansos</span></div>
       <div class="stat"><b>${corridas}</b><span>Corridas</span></div>
+      <div class="stat"><b>${atividades}</b><span>Atividades</span></div>
     </div></div>`;
   h+=`<div class="card"><div class="card-h"><h3>Registrar corrida</h3>
       <span class="chip">independente</span></div>
@@ -1358,7 +1369,34 @@ function viewSemana(){
       <select id="rG"><option value="rua">Rua</option><option value="esteira">Esteira</option>
       <option value="pista">Pista</option><option value="trilha">Trilha</option></select></div>
     <button class="btn pri full" data-act="runSave" style="margin-top:12px">Salvar corrida</button></div>`;
+  h+=`<div class="card"><div class="card-h"><h3>Registrar atividade</h3>
+      <span class="chip">independente</span></div>
+    <p class="xs mut" style="margin:0 0 10px">Para qualquer atividade física fora do plano — futebol, natação livre, bike, luta, o que for. Não altera o treino do dia.</p>
+    <div class="fld"><label class="fl">O que você fez</label><input id="aN" placeholder="Ex.: futebol, bike, natação livre"></div>
+    <div class="grid2" style="margin-top:10px">
+      <div class="fld"><label class="fl">Data</label><input type="date" id="aD" value="${SEL}"></div>
+      <div class="fld"><label class="fl">Duração em minutos</label><input id="aM" type="number" min="1" inputmode="numeric" placeholder="60"></div>
+    </div>
+    <div class="fld" style="margin-top:10px"><label class="fl">Intensidade percebida (RPE 1–10)</label>
+      <input id="aR" type="number" min="1" max="10" inputmode="numeric" placeholder="6"></div>
+    <div class="fld" style="margin-top:10px"><label class="fl">Observação · opcional</label>
+      <input id="aO" placeholder="Ex.: pelada com os amigos, ritmo leve"></div>
+    <button class="btn pri full" data-act="activitySave" style="margin-top:12px">Salvar atividade</button></div>`;
   return h;
+}
+
+/* ================================================================
+   16b. ATIVIDADE LIVRE
+   Registro solto de qualquer esforço físico fora do plano do dia.
+   Não conclui nem interfere na sessão programada.
+   ================================================================ */
+function saveActivity(){
+  const name=$('#aN').value.trim(), d=$('#aD').value, min=$('#aM').value;
+  if(!name||!d||!min) return toast('Preencha o nome, a data e a duração');
+  P.state.activities=P.state.activities||[];
+  P.state.activities.push({id:uid(),date:new Date().toISOString(),dateKey:d,
+    name,minutes:min,rpe:$('#aR').value||'',note:$('#aO').value.trim()});
+  save(); render(); toast('Atividade registrada');
 }
 
 /* ================================================================
@@ -1426,16 +1464,18 @@ function viewHistorico(){
   const items=[];
   Object.values(P.state.sessions||{}).forEach(s=>items.push({k:s.date,t:'s',d:s}));
   (P.state.runs||[]).forEach(r=>items.push({k:r.dateKey,t:'r',d:r}));
+  (P.state.activities||[]).forEach(a=>items.push({k:a.dateKey,t:'a',d:a}));
   items.sort((a,b)=>b.k.localeCompare(a.k));
   let h=`<header class="bar"><div class="id"><b>Histórico</b><span>${items.length} registros</span></div></header>`;
   if(!items.length){
-    h+=`<div class="card"><p class="mut sm" style="margin:0">Nada registrado ainda. Conclua o treino de hoje, registre um descanso ou salve uma corrida para começar a linha do tempo.</p></div>`;
+    h+=`<div class="card"><p class="mut sm" style="margin:0">Nada registrado ainda. Conclua o treino de hoje, registre um descanso ou salve uma corrida ou atividade para começar a linha do tempo.</p></div>`;
     return h;
   }
   h+=`<div class="card"><div class="stats">
       <div class="stat"><b>${Object.values(P.state.sessions).filter(s=>s.type!=='descanso').length}</b><span>Treinos</span></div>
       <div class="stat"><b>${Object.values(P.state.sessions).filter(s=>s.type==='descanso').length}</b><span>Descansos</span></div>
       <div class="stat"><b>${(P.state.runs||[]).length}</b><span>Corridas</span></div>
+      <div class="stat"><b>${(P.state.activities||[]).length}</b><span>Atividades</span></div>
       <div class="stat"><b>${streak()}</b><span>Sequência</span></div>
     </div></div><div class="card">`;
   items.forEach(it=>{
@@ -1444,12 +1484,17 @@ function viewHistorico(){
         <div class="li-i" style="color:${s.type==='descanso'?'var(--accent2)':'var(--ok)'}">${s.type==='descanso'?'○':'✓'}</div>
         <div class="li-b"><b>${esc(s.title)}</b><span>${fmtBR(s.date)} · ${MODES[s.mode]||s.mode} · ${(s.exercises||[]).length} itens${com?` · ${com} com carga`:''}</span></div>
         <div class="li-r">${esc(s.block||'')}<br>sem ${s.week||'—'}</div></div>`;
-    }else{ const r=it.d, dist=parseFloat(String(r.distance).replace(',','.'))||0;
+    }else if(it.t==='r'){ const r=it.d, dist=parseFloat(String(r.distance).replace(',','.'))||0;
       const pace=dist&&timeToSec(r.time)?mmss(timeToSec(r.time)/dist):'—';
       h+=`<div class="li"><div class="li-i" style="color:var(--accent2)">▲</div>
         <div class="li-b"><b>Corrida ${dist.toFixed(1)} km</b>
           <span>${fmtBR(r.dateKey)} · ${esc(r.time)} · ${esc(r.terrain)}${r.rpe?` · RPE ${esc(r.rpe)}`:''}</span></div>
         <div class="li-r"><b style="color:var(--accent)">${pace}</b><br>por km</div></div>`;
+    }else{ const a=it.d;
+      h+=`<div class="li"><div class="li-i" style="color:var(--accent2)">◆</div>
+        <div class="li-b"><b>${esc(a.name)}</b>
+          <span>${fmtBR(a.dateKey)} · ${esc(a.minutes)} min${a.rpe?` · RPE ${esc(a.rpe)}`:''}${a.note?` · ${esc(a.note)}`:''}</span></div>
+        <div class="li-r"><b style="color:var(--accent)">${esc(a.minutes)}</b><br>min</div></div>`;
     }
   });
   h+='</div>';
@@ -1478,9 +1523,10 @@ function viewPerfis(){
   }).join('');
   h+=`</div><p class="xs mut" style="margin:10px 0 0">Cada perfil guarda o próprio histórico, cargas e corridas. Criar um novo não altera os demais.</p></div>`;
 
-  const pc=readSemantics(P);
+  h+=`<div class="eyebrow" style="margin:22px 2px 4px">Configurações · ${esc(P.name)}</div>`;
+
   const secGoals=(P.goals||[]).filter(g=>g!==P.mainGoal);
-  h+=`<div class="card"><div class="card-h"><h3>${esc(P.name)}</h3>
+  h+=`<div class="card"><div class="card-h"><h3>Dados do perfil</h3>
       <span class="chip a">${esc(planName(P))}</span></div>
     <div class="li"><div class="li-i">${GOALS[P.mainGoal]?GOALS[P.mainGoal].ic:'◈'}</div><div class="li-b"><b>Objetivo principal</b>
       <span>${GOALS[P.mainGoal]?GOALS[P.mainGoal].lbl:'—'}${secGoals.length?` · complementos: ${secGoals.map(g=>GOALS[g]?GOALS[g].lbl:g).join(', ')}`:''}</span></div></div>
@@ -1496,8 +1542,16 @@ function viewPerfis(){
     ${P.identity?`<div class="li"><div class="li-i">✎</div><div class="li-b"><b>Sobre você</b>
       <span style="font-family:var(--ff-b);white-space:normal">${esc(P.identity)}</span></div></div>`:''}
     <div class="row-btn">
-      <button class="btn" data-act="editProfile">Editar perfil</button>
-      <button class="btn" data-act="changeTheme">Trocar tema</button>
+      <button class="btn full" data-act="editProfile">Editar dados pessoais e físicos</button>
+    </div></div>`;
+
+  h+=`<div class="card"><div class="card-h"><h3>Aparência</h3>
+      <span class="chip">${P.theme?esc(P.theme.label):'padrão'}</span></div>
+    <p class="xs mut" style="margin:0 0 10px">Ajuste o tom geral das cores do aplicativo, ou escolha entre as 8 combinações prontas.</p>
+    <div class="rd"><div class="rd-h"><span>Tom da cor</span><b id="hue-live">${Math.round((P.theme&&P.theme.hue!=null)?P.theme.hue:180)}°</b></div>
+      <input type="range" min="0" max="359" value="${Math.round((P.theme&&P.theme.hue!=null)?P.theme.hue:180)}" data-hue="live" aria-label="Tom da cor"></div>
+    <div class="row-btn">
+      <button class="btn full" data-act="changeTheme">Escolher entre as 8 combinações</button>
     </div></div>`;
 
   h+=`<div class="card"><div class="card-h"><h3>Dados</h3></div>
@@ -1799,7 +1853,7 @@ function exportData(){
   const blob=new Blob([JSON.stringify(DB,null,2)],{type:'application/json'});
   const a=document.createElement('a');
   a.href=URL.createObjectURL(blob);
-  a.download='treino-hibrido-'+todayKey()+'.json';
+  a.download='treino-simples-'+todayKey()+'.json';
   a.click(); URL.revokeObjectURL(a.href);
   toast('Cópia exportada');
 }
@@ -1818,7 +1872,7 @@ function importData(){
 }
 
 /* ---------------- cronômetro de descanso ---------------- */
-let RT=null, RTleft=0;
+let RT=null, RTleft=0, HUE_SAVE_T=null;
 function startRest(sec){
   RTleft=sec; $('#timer').classList.add('on'); updRest();
   clearInterval(RT);
@@ -1849,7 +1903,7 @@ function render(){
   $$('#tabs button').forEach(b=>b.classList.toggle('on',b.dataset.tab===TAB));
   const V={hoje:viewHoje,semana:viewSemana,evolucao:viewEvolucao,historico:viewHistorico,perfis:viewPerfis};
   $('#screen').innerHTML=`<div class="view on">${(V[TAB]||viewHoje)()}</div>`;
-  $('#foot').textContent=`Treino Híbrido · dados salvos no ${Store.kind}`;
+  $('#foot').textContent=`Treino Simples · dados salvos no ${Store.kind}`;
   requestAnimationFrame(drawCharts);
 }
 function goTab(t){ TAB=t; render(); window.scrollTo({top:0,behavior:'smooth'}); }
@@ -1948,6 +2002,7 @@ document.addEventListener('click',e=>{
     case 'openFeedback': return sheetFeedback();
     case 'unlock': return unlockDay();
     case 'runSave': return saveRun();
+    case 'activitySave': return saveActivity();
     case 'allModes': return sheetAllModes();
     case 'editTaf': return sheetTaf();
     case 'tafSave': {
@@ -2011,6 +2066,14 @@ document.addEventListener('input',e=>{
   const d=e.target.dataset, id=e.target.id;
   if(d.rd){ const el=$('#rv-'+d.rd); if(el) el.textContent=e.target.value; return; }
   if(d.fb){ FB[d.fb]=+e.target.value; const el=$('#fv-'+d.fb); if(el) el.textContent=e.target.value; return; }
+  if(d.hue){ const hue=+e.target.value; const el=$('#hue-live'); if(el) el.textContent=hue+'°';
+    const baseId=(P.theme&&P.theme.id)?P.theme.id:'d1';
+    const seed=readSemantics(P).seed;
+    const nt=retintTheme(baseId,hue,seed);
+    applyTheme(nt);
+    P.theme=nt; clearTimeout(HUE_SAVE_T); HUE_SAVE_T=setTimeout(()=>save(),400);
+    const chip=e.target.closest('.card').querySelector('.card-h .chip'); if(chip) chip.textContent=nt.label;
+    return; }
   if(id==='iwName'){ IW.name=e.target.value; updateNextEnabled(); return; }
   if(id==='iwAge'){ IW.age=e.target.value; updateNextEnabled(); return; }
   if(id==='iwH'){ IW.heightCm=e.target.value; updateIMCLive(); updateNextEnabled(); return; }
@@ -2035,7 +2098,13 @@ window.addEventListener('resize',()=>drawCharts());
    24. INICIALIZAÇÃO
    ================================================================ */
 (async function init(){
-  DB=migrate(await Store.get(KEY))||{activeId:null,profiles:[]};
+  let raw=await Store.get(KEY);
+  if(!raw){
+    /* quem já usava o app antes da marca virar Treino Simples não perde o histórico */
+    const legacy=await Store.get(KEY_LEGACY);
+    if(legacy){ raw=legacy; await Store.set(KEY,legacy); }
+  }
+  DB=migrate(raw)||{activeId:null,profiles:[]};
   if(!DB.profiles.length){ IW.step=0; $('#screen').innerHTML=renderInterview(); $('#foot').textContent=''; }
   else { await save(); render(); }
 })();
