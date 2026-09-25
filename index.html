@@ -9,6 +9,9 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700&family=Barlow:wght@400;500;600&family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet">
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
 <style>
 :root{
   --bg:#0e1113; --surface:#161b1e; --surface2:#1e2529; --line:#2b3439;
@@ -229,6 +232,11 @@ header.bar .id span{font-family:var(--ff-m);font-size:10px;color:var(--muted)}
 #toast.on{opacity:1;transform:translate(-50%,0)}
 
 canvas{display:block;max-width:100%}
+.lnk{background:none;border:none;color:var(--accent);padding:8px 4px;font-size:13.5px;text-decoration:underline;text-underline-offset:3px}
+.auth-err{color:var(--danger);font-size:13px;margin:10px 0 0;min-height:18px}
+.auth-ok{color:var(--ok);font-size:13px;margin:10px 0 0}
+.spin{width:28px;height:28px;border:3px solid var(--line);border-top-color:var(--accent);border-radius:50%;margin:0 auto 14px;animation:rot .8s linear infinite}
+@keyframes rot{to{transform:rotate(360deg)}}
 .foot{text-align:center;padding:24px 0 10px;font-family:var(--ff-m);font-size:10.5px;color:var(--muted)}
 .view{display:none}
 .view.on{display:block;animation:fade .28s}
@@ -769,7 +777,9 @@ function buildSession(p,dateKey){
 
   const arch=allocate(p.days,goals,mainGoal)[idx]||'FULL';
   const A=ARCH[arch];
-  const s=b=>Math.max(2,b+B.ds+L.ds);                 /* séries ajustadas */
+  const CB=comebackOn(p,dateKey);
+  if(CB){ S.comeback=CB; S.rpe=CB.rpe; }
+  const s=b=>Math.max(2,b+B.ds+L.ds-(CB?1:0));         /* séries ajustadas (−1 na retomada) */
   /* taf = TAF específico foi escolhido; nunca inferido de "desempenho atlético" */
   const taf=goals.includes('taf');
   const est=goals.includes('estetica')||goals.includes('hipertrofia');
@@ -910,6 +920,16 @@ function lastSessionFeedback(p){
 }
 function suggest(p,exId){
   const L=lastPerf(p,exId); if(!L) return null;
+  const CB=comebackOn(p,SEL);
+  if(CB && L.date<CB.startKey){
+    /* nenhuma carga registrada desde o início da retomada: parte da última antes da pausa */
+    const kgPre=parseFloat(String(L.load).replace(',','.'));
+    if(isFinite(kgPre)){
+      const f=v=>String(Math.round(v*2)/2).replace('.',',');
+      return {txt:`Retomada: ${f(kgPre*(1-CB.reduction))} kg (−${Math.round(CB.reduction*100)}% dos ${f(kgPre)} kg pré-pausa)`,cls:'chip w'};
+    }
+    return {txt:`Retomada: comece mais leve que na última vez (${L.load})`,cls:'chip w'};
+  }
   const kg=parseFloat(String(L.load).replace(',','.'));
   const fb=lastSessionFeedback(p);
   /* dor relatada no feedback pós-treino tem prioridade sobre o RPE isolado */
@@ -933,6 +953,66 @@ function readiness(r){
   if(t>=13) return {t,cls:'a',lbl:'APTO',cut:0,msg:'Condição normal. Mantenha a carga planejada e o RPE do bloco.'};
   if(t>=9)  return {t,cls:'w',lbl:'REDUZIDO',cut:1,msg:'Corte uma série dos acessórios e limite o RPE a 7. Preserve os movimentos principais.'};
   return {t,cls:'d',lbl:'COMPROMETIDO',cut:2,msg:'Faça apenas aquecimento, mobilidade e caminhada leve. Registre como descanso e volte amanhã.'};
+}
+
+/* ================================================================
+   11b. RETOMADA AUTOMÁTICA
+   Mede quantos dias se passaram desde a última atividade registrada
+   (treino concluído, corrida ou atividade livre). Acima de 14 dias,
+   reinicia o ciclo na fase BASE e reduz volume, RPE e carga por um
+   período proporcional à pausa.
+   ================================================================ */
+const COMEBACK_TIERS=[
+  {tier:'longa', min:60, dias:21, red:0.30, rpe:'5–6', lbl:'Pausa longa'},
+  {tier:'media', min:30, dias:14, red:0.20, rpe:'5–6', lbl:'Pausa de um mês ou mais'},
+  {tier:'curta', min:14, dias:7,  red:0.10, rpe:'6',   lbl:'Pausa curta'}
+];
+const tierRank=t=>({curta:1,media:2,longa:3}[t]||0);
+function addDays(k,n){ const d=parseKey(k); d.setDate(d.getDate()+n); return iso(d); }
+function daysBetween(a,b){ return Math.round((parseKey(b)-parseKey(a))/864e5); }
+function lastActivityKey(p,today){
+  today=today||todayKey();
+  const ks=[];
+  Object.values(p.state.sessions||{}).forEach(x=>{ if(x&&x.type!=='descanso'&&x.date) ks.push(x.date); });
+  (p.state.runs||[]).forEach(r=>r.dateKey&&ks.push(r.dateKey));
+  (p.state.activities||[]).forEach(a=>a.dateKey&&ks.push(a.dateKey));
+  const past=ks.filter(k=>k<=today).sort();
+  return past.length?past[past.length-1]:null;
+}
+/* Retorna true quando alterou o perfil (e ele precisa ser salvo). */
+function checkComeback(p,today){
+  today=today||todayKey();
+  let changed=false;
+  const cb=p.comeback;
+  /* fim do período: devolve o nível original, se tinha sido rebaixado */
+  if(cb && cb.untilKey<=today && cb.prevLevel && !cb.restored){ p.level=cb.prevLevel; cb.restored=true; changed=true; }
+  const last=lastActivityKey(p,today);
+  if(!last) return changed;
+  const gap=daysBetween(last,today);
+  const T=COMEBACK_TIERS.find(t=>gap>=t.min);
+  if(!T) return changed;
+  /* mesma pausa já tratada no mesmo nível ou acima: nada a fazer */
+  if(cb && cb.lastActivity===last && tierRank(cb.tier)>=tierRank(T.tier)) return changed;
+  const origLevel=(cb&&cb.lastActivity===last&&cb.prevLevel)?cb.prevLevel:p.level;
+  p.comeback={tier:T.tier,gap,lastActivity:last,startKey:today,untilKey:addDays(today,T.dias),
+    reduction:T.red,rpe:T.rpe,prevLevel:null,restored:false,seen:false};
+  if(T.tier==='longa' && !['return','beginner'].includes(origLevel)){
+    p.comeback.prevLevel=origLevel; p.level='return';
+  }
+  p.cycleStart=today;                 /* periodização recomeça na semana BASE */
+  return true;
+}
+function comebackOn(p,dateKey){
+  const c=p&&p.comeback;
+  return (c && dateKey>=c.startKey && dateKey<c.untilKey) ? c : null;
+}
+function comebackText(c){
+  const T=COMEBACK_TIERS.find(t=>t.tier===c.tier)||COMEBACK_TIERS[2];
+  let t=`Foram ${c.gap} dias sem treino registrado. Até ${fmtBR(c.untilKey)} o plano fica em modo de retomada: `+
+    `ciclo reiniciado na fase BASE, uma série a menos por exercício, RPE limitado a ${c.rpe} `+
+    `e cargas sugeridas ${Math.round(c.reduction*100)}% abaixo das últimas registradas antes da pausa.`;
+  if(c.prevLevel) t+=` O nível fica em "Retornando" nesse período e volta a "${(LEVELS[c.prevLevel]||{}).lbl||c.prevLevel}" depois.`;
+  return {titulo:T.lbl,texto:t};
 }
 
 /* ================================================================
@@ -1006,7 +1086,13 @@ function migrate(d){
   if(!d.profiles.find(p=>p.id===d.activeId)) d.activeId=d.profiles[0].id;
   return d;
 }
-const save=()=>Store.set(KEY,DB);
+function save(){
+  if(!USER) return Store.set(KEY,DB);           /* modo sem conta: comportamento antigo */
+  Store.set(cacheKey(),DB);                      /* cache local para abrir rápido e offline */
+  clearTimeout(SYNC_T); setSync('pending');
+  SYNC_T=setTimeout(pushCloud,700);
+  return Promise.resolve(true);
+}
 function dayState(k){
   P.state.days[k]=P.state.days[k]||{mode:P.defaultMode,done:{},warmDone:{},loads:{},rpe:{},swaps:{},readiness:null,custom:null};
   const d=P.state.days[k];
@@ -1050,7 +1136,8 @@ function renderInterview(){
         <span class="chip">Funciona sem internet</span>
       </div>
       <button class="btn pri full" data-iw="begin">Montar meu plano</button>
-      ${DB.profiles.length?`<button class="btn full ghost" style="margin-top:10px" data-iw="skip">Entrar com perfil existente</button>`:''}
+      ${!USER&&DB.profiles.length?`<button class="btn full ghost" style="margin-top:10px" data-iw="skip">Entrar com perfil existente</button>`:''}
+      ${USER?`<p class="xs mut" style="margin-top:18px">Conectado como ${esc(USER.email)} · <button class="lnk" data-auth="logout">Sair</button></p>`:''}
     </div>`;
     return h;
   }
@@ -1215,6 +1302,12 @@ function viewHoje(){
 
   if(lk) return h+lockedView(SEL);
 
+  const CBv=comebackOn(P,SEL);
+  if(CBv){
+    const ct=comebackText(CBv), total=daysBetween(CBv.startKey,CBv.untilKey), dia=daysBetween(CBv.startKey,SEL)+1;
+    h+=`<div class="note w"><div><b>Retomada · dia ${dia} de ${total}</b><p>${esc(ct.texto)}</p></div></div>`;
+  }
+
   h+=`<div class="note ${S.block.cor==='a'?'a':S.block.cor}"><div>
     <b>Semana ${S.bw} · ${S.block.nome}</b>
     <p>${esc(S.block.desc)} ${esc(S.level.nota)}</p></div></div>`;
@@ -1279,7 +1372,7 @@ function viewHoje(){
           <span class="tick">${CHECK}</span>
           <span class="exb"><span class="exn">${esc(nm)}</span>
             <span class="exp" style="display:block">${esc(pres)}</span>
-            ${sg?`<span style="display:block;margin-top:5px"><span class="${sg.cls}">↗ ${esc(sg.txt)}</span></span>`:''}
+            ${sg?`<span style="display:block;margin-top:5px"><span class="${sg.cls}" style="white-space:normal;display:inline-block;line-height:1.4">↗ ${esc(sg.txt)}</span></span>`:''}
           </span>
           <span class="chip">${esc(L.cat)}</span>
         </div>
@@ -1512,7 +1605,17 @@ function streak(){
    19. ABA PERFIS
    ================================================================ */
 function viewPerfis(){
-  let h=`<header class="bar"><div class="id"><b>Perfis</b><span>${DB.profiles.length} no aparelho</span></div></header>`;
+  let h;
+  if(USER){
+    h=`<header class="bar"><div class="id"><b>Perfil</b><span>${esc(USER.email)}</span></div></header>`;
+    h+=`<div class="card"><div class="card-h"><h3>Conta</h3><span class="chip ${SYNC_STATE==='ok'?'g':(SYNC_STATE==='err'?'d':'')}">${syncLabel()}</span></div>
+      <div class="li"><div class="li-i">@</div><div class="li-b"><b>${esc(USER.email)}</b>
+        <span>Treinos, cargas e histórico ficam guardados na sua conta e aparecem em qualquer aparelho em que você entrar.</span></div></div>
+      <div class="row-btn"><button class="btn" data-auth="resetSelf">Trocar senha</button>
+        <button class="btn dgr" data-auth="logout">Sair da conta</button></div></div>`;
+    return h+viewPerfisConfig();
+  }
+  h=`<header class="bar"><div class="id"><b>Perfis</b><span>${DB.profiles.length} no aparelho</span></div></header>`;
   h+=`<div class="card"><div class="card-h"><h3>Selecionar perfil</h3></div><div class="opts">`;
   h+=DB.profiles.map(p=>{
     const n=Object.keys(p.state.sessions||{}).length;
@@ -1522,8 +1625,10 @@ function viewPerfis(){
       `data-prof="${p.id}"`);
   }).join('');
   h+=`</div><p class="xs mut" style="margin:10px 0 0">Cada perfil guarda o próprio histórico, cargas e corridas. Criar um novo não altera os demais.</p></div>`;
-
-  h+=`<div class="eyebrow" style="margin:22px 2px 4px">Configurações · ${esc(P.name)}</div>`;
+  return h+viewPerfisConfig();
+}
+function viewPerfisConfig(){
+  let h=`<div class="eyebrow" style="margin:22px 2px 4px">Configurações · ${esc(P.name)}</div>`;
 
   const secGoals=(P.goals||[]).filter(g=>g!==P.mainGoal);
   h+=`<div class="card"><div class="card-h"><h3>Dados do perfil</h3>
@@ -1556,12 +1661,12 @@ function viewPerfis(){
 
   h+=`<div class="card"><div class="card-h"><h3>Dados</h3></div>
     <div class="row-btn" style="margin-top:0">
-      <button class="btn" data-act="newProfile">Novo perfil</button>
+      ${USER?'':`<button class="btn" data-act="newProfile">Novo perfil</button>`}
       <button class="btn" data-act="exportData">Exportar cópia</button>
       <button class="btn" data-act="importData">Importar cópia</button>
     </div>
-    ${DB.profiles.length>1?`<div class="row-btn"><button class="btn dgr" data-act="delProfile">Excluir "${esc(P.name)}"</button></div>`:''}
-    <p class="xs mut" style="margin:10px 0 0">Os dados ficam apenas neste aparelho. A cópia exportada é um arquivo de texto que serve como backup ou transferência.</p></div>`;
+    ${!USER&&DB.profiles.length>1?`<div class="row-btn"><button class="btn dgr" data-act="delProfile">Excluir "${esc(P.name)}"</button></div>`:''}
+    <p class="xs mut" style="margin:10px 0 0">${USER?'Seus dados já ficam salvos na conta. A cópia exportada é um backup extra em arquivo de texto.':'Os dados ficam apenas neste aparelho. A cópia exportada é um arquivo de texto que serve como backup ou transferência.'}</p></div>`;
   return h;
 }
 
@@ -1865,7 +1970,9 @@ function importData(){
         const d=migrate(JSON.parse(r.result));
         if(!d) return toast('Arquivo sem perfis válidos');
         if(!confirm('Substituir os dados atuais pelos do arquivo?')) return;
-        DB=d; save(); render(); toast('Cópia importada');
+        if(USER){ const pp=d.profiles.find(x=>x.id===d.activeId)||d.profiles[0]; DB={activeId:pp.id,profiles:[pp]}; }
+        else DB=d;
+        save(); render(); toast('Cópia importada');
       }catch(e){ toast('Não foi possível ler o arquivo'); } };
     r.readAsText(f); };
   inp.click();
@@ -1903,7 +2010,7 @@ function render(){
   $$('#tabs button').forEach(b=>b.classList.toggle('on',b.dataset.tab===TAB));
   const V={hoje:viewHoje,semana:viewSemana,evolucao:viewEvolucao,historico:viewHistorico,perfis:viewPerfis};
   $('#screen').innerHTML=`<div class="view on">${(V[TAB]||viewHoje)()}</div>`;
-  $('#foot').textContent=`Treino Simples · dados salvos no ${Store.kind}`;
+  $('#foot').textContent=footText();
   requestAnimationFrame(drawCharts);
 }
 function goTab(t){ TAB=t; render(); window.scrollTo({top:0,behavior:'smooth'}); }
@@ -1936,7 +2043,7 @@ document.addEventListener('click',e=>{
     else if(d.iw==='back'){ captureStep(); IW.step--; if(IW.step<1){ IW.step=0; } }
     else if(d.iw==='finish'){
       const np=newProfile({...draftProfile(),theme:THEMES[IW.themeIdx]});
-      DB.profiles.push(np); DB.activeId=np.id; SEL=todayKey(); TAB='hoje';
+      if(USER){ DB={activeId:np.id,profiles:[np]}; } else { DB.profiles.push(np); DB.activeId=np.id; } SEL=todayKey(); TAB='hoje';
       save(); render(); toast('Plano criado. Bom treino!'); return;
     }
     $('#screen').innerHTML=renderInterview();
@@ -2095,18 +2202,241 @@ $('#ovl').addEventListener('click',e=>{ if(e.target.id==='ovl') closeSheet(); })
 window.addEventListener('resize',()=>drawCharts());
 
 /* ================================================================
-   24. INICIALIZAÇÃO
+   24. CONTA NA NUVEM (Firebase)
+   Cada usuário tem um documento users/{uid} com o perfil e uma
+   subcoleção users/{uid}/sessions/{data} com os treinos concluídos.
+   As regras do Firestore só permitem que o dono leia e grave.
    ================================================================ */
-(async function init(){
-  let raw=await Store.get(KEY);
-  if(!raw){
-    /* quem já usava o app antes da marca virar Treino Simples não perde o histórico */
-    const legacy=await Store.get(KEY_LEGACY);
-    if(legacy){ raw=legacy; await Store.set(KEY,legacy); }
+const FB_CFG={
+  apiKey:"AIzaSyApKOPcY3yT9BAUpQUJbjZxLuBNimXY31g",
+  authDomain:"treino-simples-649ee.firebaseapp.com",
+  projectId:"treino-simples-649ee",
+  storageBucket:"treino-simples-649ee.firebasestorage.app",
+  messagingSenderId:"1037976036410",
+  appId:"1:1037976036410:web:fac9c546ece3598a12c103"
+};
+let AUTH=null, FS=null, USER=null, SYNCED={}, SYNC_T=null, SYNC_STATE='', LOCALIMPORT=null;
+let AUTHV={mode:'login',err:'',ok:'',busy:false,email:''};
+const cacheKey=()=>KEY+'_u_'+(USER?USER.uid:'x');
+const cloudReady=()=>typeof firebase!=='undefined'&&typeof firebase.initializeApp==='function';
+const clean=o=>JSON.parse(JSON.stringify(o));
+function stable(o){
+  if(Array.isArray(o)) return '['+o.map(stable).join(',')+']';
+  if(o&&typeof o==='object') return '{'+Object.keys(o).sort().filter(k=>o[k]!==undefined)
+    .map(k=>JSON.stringify(k)+':'+stable(o[k])).join(',')+'}';
+  return JSON.stringify(o===undefined?null:o);
+}
+function cloudInit(){
+  if(!firebase.apps||!firebase.apps.length) firebase.initializeApp(FB_CFG);
+  AUTH=firebase.auth(); FS=firebase.firestore();
+  try{ FS.enablePersistence({synchronizeTabs:true}).catch(()=>{}); }catch(e){}
+}
+function syncLabel(){
+  if(!USER) return 'neste aparelho';
+  if(SYNC_STATE==='pending') return navigator.onLine===false?'offline · envia ao reconectar':'salvando…';
+  if(SYNC_STATE==='err') return 'falha ao sincronizar';
+  return 'sincronizado';
+}
+function footText(){
+  return USER?`Treino Simples · ${USER.email} · ${syncLabel()}`:`Treino Simples · dados salvos no ${Store.kind}`;
+}
+function setSync(st){ SYNC_STATE=st; const f=$('#foot'); if(f) f.textContent=footText(); }
+function pruneDays(days){
+  const lim=addDays(todayKey(),-60), out={};
+  Object.keys(days||{}).forEach(k=>{ if(k>=lim) out[k]=days[k]; });
+  return out;
+}
+async function pushCloud(){
+  const p=DB.profiles[0]; if(!p||!USER||!FS) return;
+  const uref=FS.collection('users').doc(USER.uid);
+  const prof=clean(p); prof.state=prof.state||{};
+  delete prof.state.sessions; prof.state.days=pruneDays(prof.state.days);
+  const ops=[{t:'set',ref:uref,data:{profile:prof,email:USER.email,updatedAt:new Date().toISOString()}}];
+  const sess=p.state.sessions||{}, next={};
+  Object.keys(sess).forEach(k=>{ const str=stable(sess[k]); next[k]=str;
+    if(SYNCED[k]!==str) ops.push({t:'set',ref:uref.collection('sessions').doc(k),data:clean(sess[k])}); });
+  Object.keys(SYNCED).forEach(k=>{ if(!(k in sess)) ops.push({t:'del',ref:uref.collection('sessions').doc(k)}); });
+  try{
+    for(let i=0;i<ops.length;i+=400){
+      const b=FS.batch();
+      ops.slice(i,i+400).forEach(o=>o.t==='set'?b.set(o.ref,o.data):b.delete(o.ref));
+      await b.commit();
+    }
+    SYNCED=next; setSync('ok');
+  }catch(e){
+    console.error('sync',e); setSync('err');
+    clearTimeout(SYNC_T); SYNC_T=setTimeout(pushCloud,15000);
   }
+}
+async function pullCloud(uid){
+  const uref=FS.collection('users').doc(uid);
+  const snap=await uref.get();
+  if(!snap.exists) return {exists:false};
+  const data=snap.data()||{}; const p=data.profile;
+  if(!p) return {exists:false};
+  const ss=await uref.collection('sessions').get();
+  p.state=p.state||{}; p.state.sessions={}; SYNCED={};
+  ss.forEach(d=>{ const v=d.data(); p.state.sessions[d.id]=v; SYNCED[d.id]=stable(v); });
+  return {exists:true,db:{activeId:p.id,profiles:[p]}};
+}
+window.addEventListener('online',()=>{ if(USER&&SYNC_STATE!=='ok') pushCloud(); });
+
+/* ---------------- telas de acesso ---------------- */
+function authShell(inner){
+  $('#tabs').classList.remove('on'); $('#foot').textContent='';
+  $('#screen').innerHTML=`<div class="wrap-center">
+    <div class="center"><div class="mark">Treino<br><span>Simples</span></div>
+    <div class="rule" style="margin:18px auto"></div></div>${inner}</div>`;
+}
+function showLoading(msg){
+  authShell(`<div class="center mut sm" style="margin-top:10px"><div class="spin"></div>${esc(msg||'Carregando…')}</div>`);
+}
+function renderAuth(){
+  const m=AUTHV.mode;
+  const titulo=m==='signup'?'Criar conta':(m==='reset'?'Recuperar senha':'Entrar');
+  const sub=m==='signup'?'Seus treinos ficam salvos na sua conta e aparecem em qualquer aparelho.'
+    :(m==='reset'?'Enviaremos um link para você criar uma nova senha.':'Acesse seu plano e seu histórico.');
+  authShell(`<div class="card">
+    <h2 style="font-size:24px;margin-bottom:4px">${titulo}</h2>
+    <p class="xs mut" style="margin:0 0 14px">${sub}</p>
+    <div class="fld"><label class="fl" for="auE">E-mail</label>
+      <input id="auE" type="email" inputmode="email" autocomplete="email" autocapitalize="none" value="${esc(AUTHV.email)}" placeholder="voce@email.com"></div>
+    ${m!=='reset'?`<div class="fld" style="margin-top:10px"><label class="fl" for="auP">Senha</label>
+      <input id="auP" type="password" autocomplete="${m==='signup'?'new-password':'current-password'}" placeholder="${m==='signup'?'Mínimo de 6 caracteres':'Sua senha'}"></div>`:''}
+    ${m==='signup'?`<div class="fld" style="margin-top:10px"><label class="fl" for="auP2">Confirmar senha</label>
+      <input id="auP2" type="password" autocomplete="new-password" placeholder="Repita a senha"></div>`:''}
+    <p class="auth-err" id="auErr">${esc(AUTHV.err)}</p>
+    ${AUTHV.ok?`<p class="auth-ok">${esc(AUTHV.ok)}</p>`:''}
+    <button class="btn pri full" data-auth="submit" ${AUTHV.busy?'disabled':''} style="margin-top:6px">
+      ${AUTHV.busy?'Aguarde…':(m==='signup'?'Criar conta':(m==='reset'?'Enviar link':'Entrar'))}</button>
+    <div class="center" style="margin-top:12px">
+      ${m==='login'?`<button class="lnk" data-auth="go-signup">Não tem conta? Criar agora</button><br>
+        <button class="lnk" data-auth="go-reset">Esqueci minha senha</button>`
+        :`<button class="lnk" data-auth="go-login">Já tenho conta · Entrar</button>`}
+    </div></div>`);
+}
+function authMsg(e){
+  const c=(e&&e.code)||'';
+  const M={'auth/invalid-email':'E-mail inválido.','auth/missing-password':'Digite a senha.',
+    'auth/user-not-found':'E-mail ou senha incorretos.','auth/wrong-password':'E-mail ou senha incorretos.',
+    'auth/invalid-credential':'E-mail ou senha incorretos.','auth/invalid-login-credentials':'E-mail ou senha incorretos.',
+    'auth/email-already-in-use':'Já existe uma conta com esse e-mail. Use "Entrar".',
+    'auth/weak-password':'A senha precisa ter pelo menos 6 caracteres.',
+    'auth/too-many-requests':'Muitas tentativas. Aguarde alguns minutos e tente de novo.',
+    'auth/network-request-failed':'Sem conexão com a internet.',
+    'auth/operation-not-allowed':'Login por e-mail não está ativado no Firebase.'};
+  return M[c]||'Não foi possível concluir. Tente de novo.';
+}
+async function authSubmit(){
+  const m=AUTHV.mode, email=($('#auE')||{}).value?$('#auE').value.trim():'';
+  const pw=$('#auP')?$('#auP').value:'', pw2=$('#auP2')?$('#auP2').value:'';
+  AUTHV.email=email; AUTHV.err=''; AUTHV.ok='';
+  if(!email){ AUTHV.err='Digite seu e-mail.'; return renderAuth(); }
+  if(m!=='reset'&&!pw){ AUTHV.err='Digite a senha.'; return renderAuth(); }
+  if(m==='signup'&&pw.length<6){ AUTHV.err='A senha precisa ter pelo menos 6 caracteres.'; return renderAuth(); }
+  if(m==='signup'&&pw!==pw2){ AUTHV.err='As senhas não conferem.'; return renderAuth(); }
+  AUTHV.busy=true; renderAuth();
+  try{
+    if(m==='signup') await AUTH.createUserWithEmailAndPassword(email,pw);
+    else if(m==='login') await AUTH.signInWithEmailAndPassword(email,pw);
+    else { await AUTH.sendPasswordResetEmail(email); AUTHV.busy=false; AUTHV.mode='login';
+      AUTHV.ok='Link enviado. Confira seu e-mail, inclusive a caixa de spam.'; return renderAuth(); }
+    AUTHV.busy=false;           /* onAuthStateChanged assume daqui */
+  }catch(e){ AUTHV.busy=false; AUTHV.err=authMsg(e); renderAuth(); }
+}
+function renderImport(){
+  const L=LOCALIMPORT.profiles;
+  authShell(`<div class="card">
+    <h2 style="font-size:22px;margin-bottom:4px">Conta criada</h2>
+    <p class="xs mut" style="margin:0 0 12px">Encontramos ${L.length>1?'perfis salvos':'um perfil salvo'} neste aparelho, da versão sem conta. Quer levar o histórico para a sua conta?</p>
+    <div class="opts">${L.map((p,i)=>`<button class="opt" data-imp="${i}"><span class="tx"><b>${esc(p.name)}</b>
+      <small>${Object.keys(p.state.sessions||{}).length} sessões · ${(p.state.runs||[]).length} corridas · levar para a conta</small></span></button>`).join('')}</div>
+    <button class="btn full ghost" data-imp="novo" style="margin-top:12px">Começar do zero</button></div>`);
+}
+function renderCloudError(msg,allowLocal){
+  authShell(`<div class="card center">
+    <h2 style="font-size:22px;margin-bottom:6px">Sem conexão</h2>
+    <p class="xs mut" style="margin:0 0 14px">${esc(msg)}</p>
+    <button class="btn pri full" data-auth="reload">Tentar novamente</button>
+    ${allowLocal?`<button class="btn full ghost" data-auth="local" style="margin-top:10px">Usar sem conta neste aparelho</button>`:''}
+    ${USER?`<button class="lnk" data-auth="logout" style="margin-top:8px">Sair da conta</button>`:''}</div>`);
+}
+function afterLoad(){
+  P=DB.profiles[0]; DB.activeId=P.id; SEL=todayKey(); TAB='hoje';
+  if(checkComeback(P)) save(); else setSync('ok');
+  render();
+  const c=comebackOn(P,todayKey());
+  if(c&&!c.seen){
+    const ct=comebackText(c);
+    openSheet(`<div class="sheet-h"><h3>Bem-vindo de volta</h3><button class="x" data-act="close">×</button></div>
+      <div class="note w" style="margin-top:0"><div><b>${esc(ct.titulo)}</b><p>${esc(ct.texto)}</p></div></div>
+      ${(P.goals||[]).includes('taf')&&c.tier!=='curta'?`<p class="xs mut" style="margin:12px 0 0">Quando se sentir pronto, refaça suas marcas em Evolução → Editar marcas para recalcular as zonas de corrida.</p>`:''}
+      <button class="btn pri full" data-act="close" style="margin-top:14px">Entendi, vamos treinar</button>`);
+    c.seen=true; save();
+  }
+}
+async function onUser(u){
+  if(!u){ USER=null; SYNCED={}; DB={activeId:null,profiles:[]}; P=null; closeSheet(); return renderAuth(); }
+  USER=u; showLoading('Carregando seus treinos…');
+  let r=null;
+  try{ r=await pullCloud(u.uid); }
+  catch(e){
+    const cached=migrate(await Store.get(cacheKey()));
+    if(cached){ DB=cached; SYNCED={}; afterLoad(); setSync('pending'); return; }
+    return renderCloudError('Não foi possível carregar seus treinos. Confira a internet e tente de novo.',false);
+  }
+  if(r.exists){ DB=migrate(r.db); afterLoad(); return; }
+  /* conta nova: oferece trazer o perfil da versão sem conta, se houver */
+  const local=migrate(await Store.get(KEY))||migrate(await Store.get(KEY_LEGACY));
+  if(local&&local.profiles.length){ LOCALIMPORT=local; return renderImport(); }
+  DB={activeId:null,profiles:[]}; P=null;
+  IW.step=0; $('#tabs').classList.remove('on'); $('#screen').innerHTML=renderInterview(); $('#foot').textContent='';
+}
+async function startLocal(){
+  USER=null;
+  let raw=await Store.get(KEY);
+  if(!raw){ const legacy=await Store.get(KEY_LEGACY); if(legacy){ raw=legacy; await Store.set(KEY,legacy); } }
   DB=migrate(raw)||{activeId:null,profiles:[]};
   if(!DB.profiles.length){ IW.step=0; $('#screen').innerHTML=renderInterview(); $('#foot').textContent=''; }
-  else { await save(); render(); }
+  else { if(DB.profiles.some(p=>checkComeback(p))) await save(); await save(); render(); }
+}
+document.addEventListener('click',e=>{
+  const t=e.target.closest('[data-auth],[data-imp]'); if(!t) return;
+  const a=t.dataset.auth, im=t.dataset.imp;
+  if(im!==undefined){
+    if(im==='novo'){ LOCALIMPORT=null; DB={activeId:null,profiles:[]}; IW.step=0;
+      $('#screen').innerHTML=renderInterview(); return; }
+    const p=clean(LOCALIMPORT.profiles[+im]); LOCALIMPORT=null;
+    DB={activeId:p.id,profiles:[p]}; SYNCED={}; save(); afterLoad(); toast('Histórico levado para a sua conta'); return;
+  }
+  if(a==='submit') return authSubmit();
+  if(a==='go-signup'||a==='go-login'||a==='go-reset'){
+    AUTHV.email=$('#auE')?$('#auE').value.trim():AUTHV.email;
+    AUTHV.mode=a.slice(3); AUTHV.err=''; AUTHV.ok=''; return renderAuth(); }
+  if(a==='logout'){
+    if(!confirm('Sair da conta neste aparelho? Seus treinos continuam salvos na conta.')) return;
+    clearTimeout(SYNC_T); const go=()=>AUTH.signOut();
+    (SYNC_STATE==='pending'?pushCloud().then(go,go):go()); AUTHV={mode:'login',err:'',ok:'',busy:false,email:USER?USER.email:''};
+    return; }
+  if(a==='resetSelf'){ AUTH.sendPasswordResetEmail(USER.email)
+      .then(()=>toast('Link para trocar a senha enviado ao seu e-mail'),()=>toast('Não foi possível enviar agora')); return; }
+  if(a==='reload') return location.reload();
+  if(a==='local') return startLocal();
+});
+document.addEventListener('keydown',e=>{
+  if(e.key==='Enter'&&['auE','auP','auP2'].includes(e.target.id)){ e.preventDefault(); authSubmit(); }
+});
+
+/* ================================================================
+   25. INICIALIZAÇÃO
+   ================================================================ */
+(function init(){
+  if(!cloudReady()){
+    return renderCloudError('O módulo de login não carregou. Isso costuma acontecer sem internet na primeira abertura.',true);
+  }
+  try{ cloudInit(); }catch(e){ return renderCloudError('Não foi possível iniciar o login.',true); }
+  showLoading('Conectando…');
+  AUTH.onAuthStateChanged(u=>{ onUser(u); });
 })();
 
 </script>
